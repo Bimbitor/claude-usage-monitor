@@ -1,0 +1,7 @@
+.venv/
+.venv-build/
+.pyinstaller/
+dist/
+assets/app.ico
+__pycache__/
+*.pyc
