@@ -197,3 +197,7 @@ Qué significa eso en la práctica, con concreción:
 ## Licencia
 
 MIT — ver [LICENSE](LICENSE).
+
+Este proyecto no está afiliado a Anthropic. «Claude» es una marca de Anthropic.
+La aplicación consulta un endpoint interno no documentado de Anthropic usando
+las credenciales de tu propia cuenta.

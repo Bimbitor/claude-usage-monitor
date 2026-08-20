@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Este proyecto no está afiliado a Anthropic. "Claude" es una marca de Anthropic.
-La aplicación consulta un endpoint interno no documentado de Anthropic con las
-credenciales del propio usuario; ver el aviso del README.
