@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from . import auth, config, store
-from .errors import TransientError
+from .errors import RateLimited, TransientError, parse_retry_after
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,9 @@ class UsageSnapshot:
     plan: str | None = None
     stale: bool = False
     error: str | None = None
+    # El servidor limita las peticiones: no es un fallo de red ni de sesion,
+    # y el panel lo cuenta de otra manera.
+    rate_limited: bool = False
 
     def por_etiqueta(self, etiqueta: str) -> Limite | None:
         return next((l for l in self.limites if l.etiqueta == etiqueta), None)
@@ -160,6 +163,12 @@ class UsageClient:
     def __init__(self, creds: dict):
         self.creds = creds
         self._sesion = requests.Session()
+        self._ultimo_forzado = 0.0
+
+    def usar(self, creds: dict) -> None:
+        """Sustituye las credenciales tras un login nuevo."""
+        self.creds = creds
+        self._ultimo_forzado = 0.0
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -174,13 +183,16 @@ class UsageClient:
         respuesta = self._get()
 
         if respuesta.status_code == 401:
-            # Token rechazado antes de tiempo: un intento de renovacion forzada.
-            log.info("401 del endpoint de uso; forzando renovacion del token")
-            self.creds = auth.ensure_fresh(self.creds, forzar=True)
-            respuesta = self._get()
+            respuesta = self._reintentar_tras_401()
 
-        if respuesta.status_code == 401:
-            raise auth.AuthError("La sesión caducó, vuelve a iniciar sesión")
+        if respuesta.status_code == 429:
+            raise RateLimited(
+                "El servidor está limitando las peticiones",
+                parse_retry_after(respuesta.headers.get("Retry-After")),
+            )
+        if respuesta.status_code == 403:
+            # Suele ser el proxy de delante de la API, no la sesion.
+            raise UsageError("Acceso rechazado temporalmente (403)")
         if not respuesta.ok:
             raise UsageError(f"El servidor respondió {respuesta.status_code}")
 
@@ -192,6 +204,26 @@ class UsageClient:
         snapshot = parse_usage(datos)
         store.cache_snapshot(datos)
         return snapshot
+
+    def _reintentar_tras_401(self):
+        """Un 401 solo justifica una renovacion forzada de vez en cuando.
+
+        Sin este freno, un 401 repetido (que a veces manda la API sin que la
+        sesion tenga nada de malo) encadenaria renovaciones y, con rotacion de
+        refresh token, acabaria quemando la sesion de verdad.
+        """
+        ahora = time.time()
+        if ahora - self._ultimo_forzado < config.FORCED_REFRESH_COOLDOWN:
+            raise UsageError("El servidor devolvió 401; se reintentará en breve")
+
+        log.info("401 del endpoint de uso; forzando renovacion del token")
+        self._ultimo_forzado = ahora
+        self.creds = auth.ensure_fresh(self.creds, forzar=True)
+        respuesta = self._get()
+        if respuesta.status_code == 401:
+            # Token recien renovado y sigue rechazado: ahora si es la sesion.
+            raise auth.AuthError("La sesión caducó, vuelve a iniciar sesión", definitivo=True)
+        return respuesta
 
     def _get(self):
         try:

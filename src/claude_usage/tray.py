@@ -45,7 +45,15 @@ class Tray:
         except Exception:
             log.debug("El icono ya estaba detenido", exc_info=True)
 
-    def update(self, snapshot: api.UsageSnapshot | None) -> None:
+    def notificar(self, texto: str) -> None:
+        """Globo de notificacion de Windows. No esta en todos los backends."""
+        try:
+            self.icon.notify(texto, config.APP_TITLE)
+        except Exception:
+            log.debug("El icono no admite notificaciones", exc_info=True)
+
+    def update(self, snapshot: api.UsageSnapshot | None,
+               sesion_caducada: bool = False) -> None:
         sesion = snapshot.sesion if snapshot else None
         semanal = snapshot.semanal if snapshot else None
         apagado = snapshot is None or snapshot.stale or bool(snapshot.error)
@@ -55,9 +63,12 @@ class Tray:
             semanal.porcentaje if semanal else None,
             apagado=apagado,
         )
-        self.icon.title = self._tooltip(snapshot)
+        self.icon.title = self._tooltip(snapshot, sesion_caducada)
 
-    def _tooltip(self, snapshot: api.UsageSnapshot | None) -> str:
+    def _tooltip(self, snapshot: api.UsageSnapshot | None,
+                 sesion_caducada: bool = False) -> str:
+        if sesion_caducada:
+            return f"{config.APP_TITLE}\nsesión caducada · pulsa para entrar"
         if snapshot is None:
             return f"{config.APP_TITLE}\nconectando…"
         if snapshot.error and not snapshot.limites:

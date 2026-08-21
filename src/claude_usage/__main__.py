@@ -8,7 +8,7 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
-from . import api, auth, config, panel, poller, store, tray, winutil
+from . import api, auth, config, errors, panel, poller, store, tray, winutil
 
 log = logging.getLogger("claude_usage")
 
@@ -32,9 +32,15 @@ class App:
         self.root = root
         self.poller: poller.Poller | None = None
         self.snapshot: api.UsageSnapshot | None = None
+        self.sesion_caducada = False
+        self.demo = False
         self._login = None
+        self._avisado = False
 
-        self.panel = panel.UsagePanel(root, on_refresh=self.refrescar, on_login=self.pedir_login)
+        self.panel = panel.UsagePanel(
+            root, on_refresh=self.refrescar, on_login=self.pedir_login,
+            sesion_caducada=lambda: self.sesion_caducada,
+        )
         self.tray = tray.Tray(
             on_toggle=lambda: self.root.after(0, self.panel.toggle),
             on_refresh=lambda: self.root.after(0, self.refrescar),
@@ -46,6 +52,8 @@ class App:
     def arrancar(self, creds: dict) -> None:
         """Pinta el ultimo dato conocido y lanza el sondeo en segundo plano."""
         self._parar_poller()  # p. ej. al volver a iniciar sesion
+        self.sesion_caducada = False
+        self._avisado = False
         cacheado = api.snapshot_cacheado()
         if cacheado:
             self._aplicar(cacheado)
@@ -55,13 +63,15 @@ class App:
             cliente,
             on_snapshot=lambda s: self.root.after(0, self._aplicar, s),
             on_error=lambda e, es_auth: self.root.after(0, self._fallo, e, es_auth),
-            intervalo=int(store.load_settings().get("poll_seconds") or config.POLL_SECONDS),
+            intervalo=store.poll_seconds(),
         )
         self.poller.start()
 
     def arrancar_demo(self) -> None:
         """Datos de ejemplo para revisar la interfaz sin iniciar sesión."""
         from datetime import datetime, timedelta, timezone
+
+        self.demo = True
 
         # Mismos límites que reporta un plan Pro real: sesión y semanal.
         ahora = datetime.now(timezone.utc)
@@ -78,27 +88,41 @@ class App:
     # --- estado ----------------------------------------------------------
     def _aplicar(self, snapshot: api.UsageSnapshot) -> None:
         self.snapshot = snapshot
-        self.tray.update(snapshot)
+        self.tray.update(snapshot, sesion_caducada=self.sesion_caducada)
         self.panel.set_snapshot(snapshot)
 
-    def _fallo(self, error: Exception, es_auth: bool) -> None:
-        if es_auth:
-            store.clear_credentials()
-            self._parar_poller()
-            self.pedir_login()
-            return
-        # Fallo de red: se conserva el ultimo dato marcado como obsoleto.
+    def _fallo(self, error: Exception, sesion_caducada: bool) -> None:
+        """Ningun fallo borra la sesion del disco.
+
+        Ni siquiera cuando el servidor la invalida: el fichero se sustituye
+        cuando haya un login nuevo. Y la ventana de login no se abre sola
+        encima de lo que este haciendo el usuario, basta con avisar.
+        """
         if self.snapshot is None:
             self.snapshot = api.UsageSnapshot()
         self.snapshot.stale = True
         self.snapshot.error = str(error)
+        self.snapshot.rate_limited = isinstance(error, errors.RateLimited)
+
+        if sesion_caducada:
+            self.sesion_caducada = True
+            self.snapshot.rate_limited = False
+            self.snapshot.error = "La sesión ha caducado"
+            if not self._avisado:
+                self._avisado = True
+                self.tray.notificar("La sesión de Claude ha caducado. "
+                                    "Abre el panel para volver a iniciarla.")
+
         self._aplicar(self.snapshot)
 
-    def refrescar(self) -> None:
-        if self.poller:
-            self.poller.refresh_now()
-        else:
+    def refrescar(self) -> float:
+        """Pide dato fresco. Devuelve los segundos de espera si hay que aguardar."""
+        if self.demo:
+            return 0.0
+        if self.sesion_caducada or self.poller is None:
             self.pedir_login()
+            return 0.0
+        return self.poller.refresh_now()
 
     # --- sesion ----------------------------------------------------------
     def pedir_login(self) -> None:
@@ -117,8 +141,17 @@ class App:
 
     def _tras_login(self, creds: dict) -> None:
         self._login = None
-        self.arrancar(creds)
-        self.tray.update(self.snapshot)
+        self.sesion_caducada = False
+        self._avisado = False
+        if self.poller is not None and self.poller.pausado:
+            # El hilo sigue vivo esperando credenciales nuevas: no hace falta
+            # levantar otro (dos pollers sobre la misma sesion se pisan).
+            if self.snapshot is not None:
+                self.snapshot.error = None
+            self.poller.retomar(creds)
+        else:
+            self.arrancar(creds)
+        self.tray.update(self.snapshot, sesion_caducada=False)
 
     def cerrar_sesion(self) -> None:
         if not messagebox.askyesno(
@@ -130,6 +163,8 @@ class App:
         self._parar_poller()
         store.clear_credentials()
         self.snapshot = None
+        self.sesion_caducada = False
+        self._avisado = False
         self.tray.update(None)
         self.panel.hide()
         self.pedir_login()
@@ -137,9 +172,13 @@ class App:
     def _parar_poller(self) -> None:
         if self.poller:
             self.poller.stop()
+            # Se espera a que muera: dos pollers a la vez sobre las mismas
+            # credenciales provocan renovaciones simultaneas.
+            self.poller.join(timeout=2)
             self.poller = None
 
     def salir(self) -> None:
+        auth.cancelar()
         self._parar_poller()
         self.tray.stop()
         self.root.quit()

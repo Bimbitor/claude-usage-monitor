@@ -61,6 +61,7 @@ que aparecen en la barra de tareas* y activa **ClaudeUsageMonitor**.
 | Fichero | Contenido |
 |---|---|
 | `credentials.bin` | Sesión OAuth cifrada con **DPAPI** (solo la descifra tu usuario de Windows en ese equipo) |
+| `credentials.bak` | Copia de la sesión anterior; se usa si el fichero principal queda a medias |
 | `settings.json` | Intervalo de sondeo y último consumo conocido (para pintar el icono al arrancar) |
 | `app.log` | Registro rotatorio, útil si algo falla |
 
@@ -76,8 +77,10 @@ Al desinstalar se borra toda la carpeta.
 | Login | OAuth 2.0 con PKCE (S256) contra `https://claude.com/cai/oauth/authorize` |
 | Retorno | Servidor HTTP efímero en `127.0.0.1:<puerto libre>`; el navegador vuelve solo, igual que el cliente oficial |
 | Canje | `POST https://platform.claude.com/v1/oauth/token` (JSON; `state` es **obligatorio**) |
-| Sesión | Access token de 8 h, renovado automáticamente con el refresh token (5 min antes de caducar o ante un 401) |
-| Sondeo | Cada 60 s, con espera progresiva hasta 5 min si falla la red |
+| Sesión | Access token de 8 h, renovado **15 min antes** de caducar. Un solo hilo renueva a la vez (el refresh token rota) y se reintenta 4 veces antes de rendirse |
+| Sondeo | Cada 5 min con ±15 % de variación. Ante un fallo de red la espera se dobla hasta 15 min; ante un `429` se respeta `Retry-After` hasta 30 min |
+| «Actualizar» | Antirrebote de 20 s, y durante un `429` no pide nada: el panel muestra la cuenta atrás en vez de insistir |
+| Caducidad | Solo un `invalid_grant` del servidor (o una hora sin poder renovar) cierra la sesión. Un `403`, un `429` o un corte de red **nunca** la cierran, y nada borra `credentials.bin` salvo *Cerrar sesión* |
 
 > **Ojo con el host de autorización.** `https://claude.ai/oauth/authorize` todavía
 > pinta la pantalla de consentimiento, pero al pulsar *Autorizar* el POST de
@@ -143,8 +146,8 @@ src/claude_usage/
   store.py        cifrado DPAPI, credenciales y ajustes
   auth.py         PKCE, servidor de retorno, canje y refresco de tokens
   api.py          cliente del endpoint y modelo UsageSnapshot / Limite
-  errors.py       fallo temporal (se reintenta) vs. fallo de sesión (pide login)
-  poller.py       hilo de sondeo con reintento progresivo
+  errors.py       fallo temporal (se reintenta) vs. sesión caducada (pide login)
+  poller.py       hilo de sondeo: espera progresiva, antirrebote y pausa
   icons.py        dibujo del icono según el consumo
   tray.py         icono de bandeja, tooltip y menú
   panel.py        panel emergente sobre la bandeja
@@ -191,6 +194,8 @@ Qué significa eso en la práctica, con concreción:
 - **Solo Windows.** DPAPI, bandeja del sistema y clave `Run` del registro.
 - **Depende de un endpoint no documentado** que Anthropic puede cambiar.
 - **Planes Pro no reportan Opus por separado**, así que no hay fila para Opus.
+- **El endpoint de uso limita las consultas.** Por eso el sondeo es de 5 min:
+  bajarlo en `settings.json` por debajo de 120 s se corrige solo al arrancar.
 - **Sin firma de código**: SmartScreen puede avisar la primera vez que ejecutes
   el instalador.
 

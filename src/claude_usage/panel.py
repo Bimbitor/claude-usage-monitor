@@ -16,12 +16,15 @@ class UsagePanel:
     foco en la propia ventana (necesario para ocultarla al perderlo).
     """
 
-    def __init__(self, root: tk.Tk, on_refresh, on_login=None):
+    def __init__(self, root: tk.Tk, on_refresh, on_login=None, sesion_caducada=None):
         self.root = root
         self.on_refresh = on_refresh
         self.on_login = on_login
+        self.sesion_caducada = sesion_caducada or (lambda: False)
         self.snapshot: api.UsageSnapshot | None = None
         self.visible = False
+        # Hasta cuando el poller no va a preguntar nada (antirrebote o 429).
+        self._veto_hasta = 0.0
         self._tick_id: str | None = None
         self._abierto_en = 0.0
         self._zonas: list[tuple[tuple[int, int, int, int], object]] = []
@@ -68,6 +71,11 @@ class UsagePanel:
         self.hide() if self.visible else self.show()
 
     def show(self) -> None:
+        # Con un sondeo de cinco minutos, abrir el panel es la senal de que
+        # ahora si interesa el dato al segundo.
+        if (self.snapshot is not None and not self.sesion_caducada()
+                and self.snapshot.edad > config.PANEL_STALE_SECONDS):
+            self._pedir_refresco()
         self._redraw()
         self._position()
         self.win.deiconify()
@@ -146,8 +154,9 @@ class UsagePanel:
             for limite in snap.limites:
                 y = self._fila(limite, pad, y, ancho_util)
 
-        if snap is not None and snap.error:
-            self._texto(pad, y, snap.error, tam=10, color=config.COLOR_WARN)
+        aviso = self._aviso()
+        if aviso:
+            self._texto(pad, y, aviso, tam=10, color=config.COLOR_WARN)
             y += self._px(18)
 
         # Pie
@@ -155,7 +164,10 @@ class UsagePanel:
         self.canvas.create_line(pad, y, pad + ancho_util, y, fill=config.COLOR_BORDER)
         y += self._px(12)
         self._boton(pad, y, "Actualizar", self._pulsar_refresh)
-        if self.snapshot is not None and self.snapshot.error and self.on_login:
+        # Solo se ofrece volver a entrar cuando la sesion ha caducado de
+        # verdad: con un 429 o un corte de red la sesion sigue viva y
+        # proponer un login nuevo solo consigue que se pierda.
+        if self.sesion_caducada() and self.on_login:
             self._boton(pad + ancho_util, y, "Iniciar sesión", self._pulsar_login, ancla="ne")
         else:
             self._boton(pad + ancho_util, y, "Cerrar", lambda: self.hide(), ancla="ne")
@@ -203,13 +215,34 @@ class UsagePanel:
 
     def _estado(self) -> tuple[str, str]:
         snap = self.snapshot
+        if self.sesion_caducada():
+            return "sesión caducada", config.COLOR_CRIT
         if snap is None:
             return "conectando…", config.COLOR_MUTED
+        if snap.rate_limited:
+            return "servidor ocupado", config.COLOR_WARN
         if snap.error:
             return "sin conexión", config.COLOR_CRIT
         if snap.stale:
             return config.human_age(snap.edad), config.COLOR_WARN
         return f"actualizado {config.human_age(snap.edad)}", config.COLOR_OK
+
+    def _aviso(self) -> str:
+        """Linea explicativa bajo los limites: que pasa y cuando se reintenta."""
+        snap = self.snapshot
+        if self.sesion_caducada():
+            return "La sesión ha caducado. Pulsa «Iniciar sesión» para volver a entrar."
+        restante = self._veto_hasta - time.monotonic()
+        if snap is not None and snap.rate_limited:
+            if restante > 0:
+                return ("El servidor limita las consultas · reintento en "
+                        f"{config.human_espera(restante)}")
+            return "El servidor limita las consultas · reintentando…"
+        if restante > 0:
+            return f"Siguiente consulta en {config.human_espera(restante)}"
+        if snap is not None and snap.error:
+            return snap.error
+        return ""
 
     # --- interaccion -----------------------------------------------------
     def _zona_en(self, x: int, y: int):
@@ -227,10 +260,15 @@ class UsagePanel:
         self.canvas.configure(cursor="hand2" if self._zona_en(evento.x, evento.y) else "")
 
     def _pulsar_refresh(self) -> None:
-        if self.snapshot is not None:
-            self.snapshot.error = None
+        self._pedir_refresco()
         self._redraw()
-        self.on_refresh()
+
+    def _pedir_refresco(self) -> None:
+        """Pide dato fresco; si el poller esta en veto, se anota la cuenta atras."""
+        restante = self.on_refresh() or 0.0
+        self._veto_hasta = time.monotonic() + restante
+        if restante <= 0 and self.snapshot is not None and not self.snapshot.rate_limited:
+            self.snapshot.error = None
 
     def _pulsar_login(self) -> None:
         self.hide()

@@ -34,10 +34,24 @@ BETA_HEADER = "oauth-2025-04-20"
 USER_AGENT = f"{APP_NAME}/{VERSION}"
 
 # --- Sondeo ---------------------------------------------------------------
-POLL_SECONDS = 60
-POLL_BACKOFF_MAX = 300
-REFRESH_MARGIN_SECONDS = 300  # refrescar el token si le quedan menos de 5 min
+# /api/oauth/usage limita las peticiones con bastante mano dura: sondear cada
+# minuto acaba devolviendo 429 casi siempre. Cinco minutos basta de sobra
+# porque las cuentas atras del panel se recalculan en local cada segundo.
+POLL_SECONDS = 300
+POLL_MIN_SECONDS = 120       # por debajo de esto la API responde 429
+POLL_MAX_SECONDS = 3600
+POLL_JITTER = 0.15            # +-15 % en cada espera, para no sondear "en punto"
+POLL_BACKOFF_MAX = 900        # tope de la espera progresiva ante fallos de red
+RATE_LIMIT_BACKOFF_MAX = 1800  # tope mayor cuando el servidor responde 429
+MIN_REFRESH_SECONDS = 20      # antirrebote del boton "Actualizar"
+PANEL_STALE_SECONDS = 120     # al abrir el panel se pide dato fresco si es mas viejo
 HTTP_TIMEOUT = 20
+
+# --- Sesion ---------------------------------------------------------------
+REFRESH_MARGIN_SECONDS = 900   # renovar el token 15 min antes de que caduque
+AUTH_RETRY_WAITS = (5, 20, 60, 180)  # reintentos dentro de una misma renovacion
+FORCED_REFRESH_COOLDOWN = 300  # un 401 no puede forzar renovaciones en cadena
+SESSION_GRACE_SECONDS = 3600   # se insiste 1 h antes de dar la sesion por muerta
 
 # --- Rutas ----------------------------------------------------------------
 
@@ -118,6 +132,16 @@ def local_stamp(dt: datetime | None) -> str:
         return "--"
     local = dt.astimezone()
     return f"{local.day} {_MESES[local.month - 1]}, {local:%H:%M}"
+
+
+def human_espera(seconds: float) -> str:
+    """Cuenta atras corta para el panel: '12 s', '4 min', '1 h 5 min'."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600} h {(seconds % 3600) // 60} min"
 
 
 def human_age(seconds: float) -> str:

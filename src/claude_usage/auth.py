@@ -25,9 +25,26 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 
 from . import config, store
-from .errors import AuthError, TransientError  # noqa: F401  (reexportados)
+from .errors import (  # noqa: F401  (reexportados)
+    AuthError,
+    RateLimited,
+    TransientError,
+    parse_retry_after,
+)
 
 log = logging.getLogger(__name__)
+
+# Un solo hilo renueva a la vez: el servidor rota el refresh token, asi que
+# dos renovaciones simultaneas invalidan la del otro y tiran la sesion.
+_LOCK = threading.RLock()
+# Se activa al salir para no dejar la app colgada en una espera de reintento.
+_parada = threading.Event()
+
+
+def cancelar() -> None:
+    """Interrumpe las esperas entre reintentos (se llama al cerrar la app)."""
+    _parada.set()
+
 
 _PAGINA_OK = """<!doctype html><html lang="es"><head><meta charset="utf-8">
 <title>Sesión iniciada</title></head>
@@ -182,11 +199,32 @@ def _token_hosts() -> list[str]:
     return hosts
 
 
+# Codigos OAuth con los que el servidor dice que estas credenciales ya no
+# sirven. Cualquier otro 4xx puede ser un proxy, una peticion mal formada o una
+# carrera de rotacion: eso se reintenta, no se cierra la sesion.
+_ERRORES_DEFINITIVOS = frozenset({
+    "invalid_grant", "invalid_client", "unauthorized_client", "access_denied",
+})
+
+
+def _error_oauth(resp) -> tuple[str, str]:
+    """(codigo, descripcion) del cuerpo JSON del error; vacios si no lo trae."""
+    try:
+        cuerpo = resp.json()
+    except ValueError:
+        return "", ""
+    if not isinstance(cuerpo, dict):
+        return "", ""
+    return str(cuerpo.get("error") or ""), str(cuerpo.get("error_description") or "")
+
+
 def _post_token(payload: dict[str, str]) -> dict:
     """POST al endpoint de token probando los hosts conocidos en orden.
 
-    Distingue el rechazo real de la sesion (AuthError) del fallo pasajero
-    (TransientError): un corte de red no debe desconectar al usuario.
+    Solo los codigos OAuth de ``_ERRORES_DEFINITIVOS`` cierran la sesion. Un
+    403 de un proxy, un cuerpo vacio o un ``invalid_request`` se devuelven como
+    fallo reintentable, y antes se prueba el otro host por si el problema era
+    ese: perder el refresh token por un tropiezo pasajero es irreversible.
     """
     ultimo_error: Exception | None = None
     for url in _token_hosts():
@@ -202,7 +240,7 @@ def _post_token(payload: dict[str, str]) -> dict:
                 timeout=config.HTTP_TIMEOUT,
             )
         except requests.RequestException as exc:
-            ultimo_error = exc
+            ultimo_error = TransientError(f"{url} inalcanzable: {exc}")
             log.warning("Endpoint de token %s inalcanzable: %s", url, exc)
             continue
 
@@ -214,28 +252,44 @@ def _post_token(payload: dict[str, str]) -> dict:
         if resp.status_code in (404, 405):
             ultimo_error = TransientError(f"{url} respondio {resp.status_code}")
             continue
-        # Sobrecarga o averia del servidor: se reintentara mas tarde.
-        if resp.status_code == 429 or resp.status_code >= 500:
-            raise TransientError(f"El servidor no está disponible ({resp.status_code})")
-        # 400 / 401 / 403: el servidor rechaza estas credenciales.
-        raise AuthError(f"El servidor rechazó la petición ({resp.status_code}): {resp.text[:300]}")
+        if resp.status_code == 429:
+            raise RateLimited(
+                "El servidor está limitando las peticiones",
+                parse_retry_after(resp.headers.get("Retry-After")),
+            )
+        if resp.status_code >= 500:
+            ultimo_error = TransientError(f"El servidor no está disponible ({resp.status_code})")
+            continue
 
-    raise TransientError(f"No se pudo contactar con el servidor de tokens: {ultimo_error}")
+        codigo, descripcion = _error_oauth(resp)
+        if codigo in _ERRORES_DEFINITIVOS:
+            raise AuthError(
+                descripcion or f"El servidor invalidó la sesión ({codigo})", definitivo=True
+            )
+        # 4xx sin codigo OAuth reconocible: dudoso, se reintenta.
+        ultimo_error = AuthError(
+            f"El servidor rechazó la petición ({resp.status_code}): "
+            f"{descripcion or resp.text[:200]}"
+        )
+        log.warning("Respuesta dudosa de %s: HTTP %s %s", url, resp.status_code, codigo or "")
+
+    raise ultimo_error or TransientError("No se pudo contactar con el servidor de tokens")
 
 
-def _to_credentials(data: dict, refresh_previo: str | None = None) -> dict:
+def _to_credentials(data: dict, previas: dict | None = None) -> dict:
     access = data.get("access_token")
     if not access:
         raise AuthError("La respuesta del servidor no incluye access_token")
     expires_in = int(data.get("expires_in") or 3600)
+    previas = previas or {}
     return {
         "access_token": access,
         # Si el servidor no rota el refresh token, se conserva el anterior.
-        "refresh_token": data.get("refresh_token") or refresh_previo,
+        "refresh_token": data.get("refresh_token") or previas.get("refresh_token"),
         "expires_at": time.time() + expires_in,
-        "scopes": data.get("scope") or config.SCOPES,
-        "account": (data.get("account") or {}).get("email_address"),
-        "subscription": data.get("subscription_type"),
+        "scopes": data.get("scope") or previas.get("scopes") or config.SCOPES,
+        "account": (data.get("account") or {}).get("email_address") or previas.get("account"),
+        "subscription": data.get("subscription_type") or previas.get("subscription"),
     }
 
 
@@ -279,29 +333,76 @@ def exchange_code(flow: LoginFlow, codigo_pegado: str = "") -> dict:
         "state": state_final,
     })
     creds = _to_credentials(data)
-    store.save_credentials(creds)
+    if not store.save_credentials(creds):
+        log.warning("Login correcto pero no se pudo guardar la sesión en disco")
+    _parada.clear()
     flow.cerrar()
     return creds
 
 
 def refresh(creds: dict) -> dict:
-    """Renueva el access token. El refresh token puede rotar: se guarda el nuevo."""
-    refresh_token = creds.get("refresh_token")
-    if not refresh_token:
-        raise AuthError("No hay refresh token guardado")
-    data = _post_token({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": config.CLIENT_ID,
-    })
-    nuevas = _to_credentials(data, refresh_previo=refresh_token)
-    store.save_credentials(nuevas)
-    log.info("Token renovado; caduca en %.0f min", (nuevas["expires_at"] - time.time()) / 60)
-    return nuevas
+    """Renueva el access token, insistiendo si el fallo parece pasajero.
+
+    Una renovacion ocurre cada ocho horas: merece la pena pelearla. Solo se
+    rinde ante un rechazo definitivo del servidor, y nunca borra nada del
+    disco: de eso decide la aplicacion.
+    """
+    with _LOCK:
+        # Otro hilo pudo renovar mientras esperabamos el cerrojo. Con rotacion
+        # de refresh token, volver a pedir aqui invalidaria el token recien
+        # guardado, asi que se reutiliza el suyo.
+        guardadas = store.load_credentials()
+        if (guardadas and guardadas.get("access_token") != creds.get("access_token")
+                and float(guardadas.get("expires_at") or 0) - time.time()
+                > config.REFRESH_MARGIN_SECONDS):
+            log.info("Otro hilo ya habia renovado el token; se reutiliza")
+            return guardadas
+
+        base = guardadas if (guardadas and guardadas.get("refresh_token")) else creds
+        refresh_token = base.get("refresh_token")
+        if not refresh_token:
+            raise AuthError("No hay refresh token guardado", definitivo=True)
+
+        ultimo: Exception | None = None
+        for espera in (0, *config.AUTH_RETRY_WAITS):
+            if espera:
+                log.info("Reintentando la renovación del token en %ss", espera)
+                if _parada.wait(espera):
+                    break
+            try:
+                data = _post_token({
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": config.CLIENT_ID,
+                })
+            except AuthError as exc:
+                if exc.definitivo:
+                    raise
+                ultimo = exc
+                continue
+            except RateLimited:
+                # La espera la gestiona el poller, que sabe interrumpirla.
+                raise
+            except TransientError as exc:
+                ultimo = exc
+                continue
+
+            nuevas = _to_credentials(data, previas=base)
+            store.save_credentials(nuevas)
+            log.info("Token renovado; caduca en %.0f min",
+                     (nuevas["expires_at"] - time.time()) / 60)
+            return nuevas
+
+        raise ultimo or TransientError("No se pudo renovar el token")
 
 
 def ensure_fresh(creds: dict, forzar: bool = False) -> dict:
-    """Devuelve credenciales con access token valido, renovando si hace falta."""
+    """Devuelve credenciales con access token valido, renovando si hace falta.
+
+    El margen es amplio (15 min) a proposito: renovar con tiempo de sobra deja
+    hueco para reintentar si el primer intento falla, en vez de descubrir que
+    el token ha caducado con un 401 en la cara.
+    """
     caduca = float(creds.get("expires_at") or 0)
     if forzar or caduca - time.time() < config.REFRESH_MARGIN_SECONDS:
         return refresh(creds)
