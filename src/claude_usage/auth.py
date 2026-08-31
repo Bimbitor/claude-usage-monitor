@@ -20,7 +20,7 @@ import time
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
@@ -72,6 +72,14 @@ def _b64url(raw: bytes) -> str:
 class _CallbackHandler(BaseHTTPRequestHandler):
     """Recoge el ?code=...&state=... con el que vuelve el navegador."""
 
+    # Un socket que se conecta y no manda nada -las conexiones especulativas
+    # que abre Chrome, sobre todo- no puede dejar el handler bloqueado en la
+    # lectura: sin este tope, esa conexion colgaba el servidor entero y el
+    # login se quedaba "conectando..." para siempre.
+    timeout = 5
+    # HTTP/1.0: sin keep-alive, el navegador cierra en cuanto recibe la pagina.
+    protocol_version = "HTTP/1.0"
+
     def do_GET(self) -> None:  # noqa: N802  (nombre impuesto por BaseHTTPRequestHandler)
         partes = urllib.parse.urlparse(self.path)
         if partes.path.rstrip("/") not in ("/callback", ""):
@@ -95,15 +103,26 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         log.debug("callback local: " + formato, *args)
 
 
+class _HttpCallback(ThreadingHTTPServer):
+    """Un hilo por conexion: una conexion colgada no bloquea a las demas ni el
+    cierre del servidor. ``daemon_threads`` ya viene activo en la clase base."""
+
+    # server_close() no espera a los hilos de peticion todavia vivos (p. ej.
+    # una conexion especulativa a mitad del tope de 5 s).
+    block_on_close = False
+
+
 class CallbackServer:
     """Servidor HTTP efimero en 127.0.0.1 con puerto libre asignado por el SO."""
 
     def __init__(self) -> None:
-        self._http = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        self._http = _HttpCallback(("127.0.0.1", 0), _CallbackHandler)
         self._http.recibido = threading.Event()  # type: ignore[attr-defined]
         self._http.resultado = ("", "")  # type: ignore[attr-defined]
+        self._cerrado = False
         self.puerto = self._http.server_address[1]
-        self._hilo = threading.Thread(target=self._http.serve_forever, daemon=True)
+        self._hilo = threading.Thread(target=self._http.serve_forever,
+                                      name="oauth-callback", daemon=True)
         self._hilo.start()
         log.info("Servidor de callback escuchando en 127.0.0.1:%s", self.puerto)
 
@@ -118,8 +137,27 @@ class CallbackServer:
         return None
 
     def cerrar(self) -> None:
+        """Para el servidor sin bloquear a quien llama.
+
+        ``shutdown()`` espera a que el bucle de ``serve_forever`` confirme la
+        parada; se lanza en un hilo aparte con tope de espera para que ni un
+        imprevisto en el bucle deje colgado el canje de tokens (que es justo
+        lo que se llama despues de esto).
+        """
+        if self._cerrado:
+            return
+        self._cerrado = True
+
+        def _apagar() -> None:
+            try:
+                self._http.shutdown()
+            except Exception:
+                log.debug("Fallo en shutdown() del servidor de callback", exc_info=True)
+
+        parada = threading.Thread(target=_apagar, name="oauth-callback-stop", daemon=True)
+        parada.start()
+        parada.join(timeout=3)
         try:
-            self._http.shutdown()
             self._http.server_close()
         except Exception:
             log.debug("Fallo al cerrar el servidor de callback", exc_info=True)

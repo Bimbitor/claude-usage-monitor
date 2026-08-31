@@ -83,6 +83,25 @@ try:
     check("servidor local escuchando", flujo.servidor is not None)
     check("state de 32 bytes", len(flujo.state) == 43)
     check("code_challenge_method=S256", "code_challenge_method=S256" in flujo.url)
+
+    # Regresion: una conexion que se abre y no manda nada (los preconnect
+    # especulativos de Chrome) no debe colgar el servidor ni su cierre, o el
+    # login se queda "conectando..." para siempre.
+    import http.client as _hc
+    import socket as _sock
+    import time
+
+    _pre = _sock.create_connection(("127.0.0.1", flujo.servidor.puerto))
+    _c = _hc.HTTPConnection("127.0.0.1", flujo.servidor.puerto, timeout=5)
+    _c.request("GET", "/callback?code=ABC&state=" + flujo.state)
+    _r = _c.getresponse(); _r.read()
+    check("el callback responde aun con una conexión muda abierta", _r.status == 200)
+    check("y recoge el código", (flujo.servidor.recibido() or ("",))[0] == "ABC")
+    _t0 = time.time()
+    flujo.servidor.cerrar()
+    check("cerrar() no se bloquea por la conexión muda", time.time() - _t0 < 4)
+    _pre.close()
+    flujo.servidor = None  # ya cerrado; que el finally no lo reintente
 finally:
     flujo.cerrar()
 
