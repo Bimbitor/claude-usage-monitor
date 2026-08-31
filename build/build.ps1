@@ -82,6 +82,7 @@ Write-Host "Compilando el .exe..."
     --workpath (Join-Path $raiz ".pyinstaller") `
     --specpath (Join-Path $raiz ".pyinstaller") `
     --hidden-import pystray._win32 `
+    --collect-submodules truststore `
     --exclude-module numpy --exclude-module pytest `
     (Join-Path $raiz "app.py")
 Assert-Ok "PyInstaller"

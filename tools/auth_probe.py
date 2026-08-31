@@ -3,6 +3,7 @@
     python tools/auth_probe.py             # login completo (abre el navegador)
     python tools/auth_probe.py --url-only  # solo imprime la URL y espera el retorno
     python tools/auth_probe.py --hosts     # que hosts de token responden
+    python tools/auth_probe.py --tls       # diagnostico de verificacion TLS
 """
 
 from __future__ import annotations
@@ -15,7 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import requests  # noqa: E402
 
-from claude_usage import api, auth, config, store  # noqa: E402
+from claude_usage import api, auth, config, netconf, store  # noqa: E402
+
+# Misma configuracion TLS que la app: sin esto, en redes que inspeccionan HTTPS
+# la sonda falla donde la app funciona (o al reves).
+netconf.configurar_tls()
 
 ESPERA_MAX = 300
 
@@ -45,6 +50,36 @@ def probar_hosts() -> None:
             else "existe y responde"
         print(f"  {url}\n    HTTP {resp.status_code} -> {veredicto}")
         print(f"    cuerpo: {resp.text[:200]}\n")
+
+
+def diagnostico_tls() -> None:
+    """Muestra si requests puede validar los servidores y quien firma su cert."""
+    import socket
+    import ssl
+
+    hosts = [config.USAGE_URL.split("/")[2], *[u.split("/")[2] for u in config.TOKEN_URLS]]
+    print("Certificado que presenta cada servidor (así se detecta un proxy TLS):\n")
+    for host in dict.fromkeys(hosts):
+        try:
+            with socket.create_connection((host, 443), timeout=15) as raw:
+                with ssl.create_default_context().wrap_socket(
+                    raw, server_hostname=host
+                ) as tls:
+                    emisor = dict(x[0] for x in tls.getpeercert()["issuer"])
+            print(f"  {host}\n    firmado por: {emisor.get('organizationName')} / "
+                  f"{emisor.get('commonName')}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {host}\n    no se pudo leer el certificado: {exc}")
+
+    print("\n¿Puede requests validar los endpoints de token?")
+    for url in config.TOKEN_URLS:
+        try:
+            requests.head(url, timeout=15)
+            print(f"  {url}\n    OK")
+        except requests.exceptions.SSLError as exc:
+            print(f"  {url}\n    FALLA la verificación TLS: {str(exc)[:160]}")
+        except requests.RequestException as exc:
+            print(f"  {url}\n    (sin verificar) otro error de red: {str(exc)[:120]}")
 
 
 def login_completo(abrir: bool = True) -> int:
@@ -101,6 +136,9 @@ def login_completo(abrir: bool = True) -> int:
 
 
 if __name__ == "__main__":
+    if "--tls" in sys.argv:
+        diagnostico_tls()
+        sys.exit(0)
     if "--hosts" in sys.argv:
         probar_hosts()
         sys.exit(0)

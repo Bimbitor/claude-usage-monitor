@@ -239,6 +239,18 @@ def _post_token(payload: dict[str, str]) -> dict:
                 },
                 timeout=config.HTTP_TIMEOUT,
             )
+        except requests.exceptions.SSLError as exc:
+            # Casi siempre: la red inspecciona TLS (Zscaler, antivirus...) y
+            # requests no reconoce la CA que firma el certificado. No es un
+            # fallo de la sesion; se avisa con algo accionable.
+            ultimo_error = TransientError(
+                "No se pudo verificar el certificado del servidor. Si tu red "
+                "usa un proxy o antivirus que inspecciona HTTPS, instala "
+                "'truststore' o define la variable REQUESTS_CA_BUNDLE con el "
+                "certificado de tu organización."
+            )
+            log.warning("Fallo de verificación TLS con %s: %s", url, exc)
+            continue
         except requests.RequestException as exc:
             ultimo_error = TransientError(f"{url} inalcanzable: {exc}")
             log.warning("Endpoint de token %s inalcanzable: %s", url, exc)

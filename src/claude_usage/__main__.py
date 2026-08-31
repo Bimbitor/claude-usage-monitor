@@ -8,7 +8,7 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
-from . import api, auth, config, errors, panel, poller, store, tray, winutil
+from . import api, auth, config, errors, netconf, panel, poller, store, tray, winutil
 
 log = logging.getLogger("claude_usage")
 
@@ -189,6 +189,10 @@ def main() -> int:
     winutil.set_dpi_aware()
     _configurar_log()
     log.info("Arrancando %s %s", config.APP_TITLE, config.VERSION)
+    # Antes de cualquier peticion: en redes que inspeccionan TLS (Zscaler y
+    # demas) requests no confia en la CA corporativa y el login no llega a
+    # completarse.
+    netconf.configurar_tls()
 
     demo = "--demo" in sys.argv
     if not demo and not winutil.single_instance(f"{config.APP_NAME}-mutex"):

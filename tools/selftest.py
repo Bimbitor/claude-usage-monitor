@@ -86,6 +86,22 @@ try:
 finally:
     flujo.cerrar()
 
+print("\nConfiguración TLS (redes que inspeccionan HTTPS: Zscaler y demás):")
+from claude_usage import netconf  # noqa: E402
+
+netconf._configurado = False
+netconf.configurar_tls()
+llamadas_previas = netconf._configurado
+netconf.configurar_tls()  # segunda llamada: no debe volver a tocar nada
+check("configurar_tls() arranca sin lanzar (con o sin truststore)", llamadas_previas)
+check("configurar_tls() es idempotente", netconf._configurado is True)
+try:
+    import truststore  # noqa: F401
+    check("truststore disponible: TLS irá contra el almacén de Windows", True)
+except ImportError:
+    print("  [----] truststore no instalado en este entorno "
+          "(pip install -r requirements.txt)")
+
 print("\nClasificación de errores (un corte de red no debe cerrar la sesión):")
 from claude_usage import errors  # noqa: E402
 check("UsageError es temporal", issubclass(api.UsageError, errors.TransientError))

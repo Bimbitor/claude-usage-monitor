@@ -1,3 +1,7 @@
 pystray>=0.19.5
 Pillow>=10.0.0
 requests>=2.31.0
+# Valida TLS contra el almacen de certificados de Windows: imprescindible en
+# redes que inspeccionan HTTPS (Zscaler, Netskope, antivirus corporativo...),
+# donde requests+certifi no reconoce la CA de la organizacion.
+truststore>=0.10.0
