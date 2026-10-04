@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import winreg
+from pathlib import Path
 
 from . import config
 
@@ -17,8 +18,12 @@ def _comando() -> str:
     """Linea de comandos con la que relanzar la app."""
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}"'
-    # En desarrollo se relanza el modulo con el interprete actual.
-    return f'"{sys.executable}" -m claude_usage'
+    # En desarrollo se relanza app.py por ruta absoluta. El lanzador resuelve
+    # 'src' por si mismo (sys.path), asi que funciona sin depender del directorio
+    # de trabajo: imprescindible cuando lo ejecuta la clave Run al iniciar sesion
+    # (ahi el CWD es System32, no el del proyecto). Un '-m claude_usage' fallaria.
+    launcher = Path(__file__).resolve().parents[2] / "app.py"
+    return f'"{sys.executable}" "{launcher}"'
 
 
 def is_enabled() -> bool:
