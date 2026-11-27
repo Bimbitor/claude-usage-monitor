@@ -4,7 +4,7 @@ Monitor de consumo del plan de Claude para la bandeja del sistema de Windows.
 Muestra lo mismo que la sección *Usage* de la app y que `/usage` en Claude Code,
 pero siempre a la vista y sin abrir nada.
 
-![Panel con el consumo de sesión y semanal](docs/panel.png)
+![Panel con el consumo de sesión y semanal](https://raw.githubusercontent.com/Bimbitor/claude-usage-monitor/main/docs/panel.png)
 
 ## Qué muestra
 
@@ -18,7 +18,7 @@ El icono cambia de color según el consumo más alto: verde (<50 %), ámbar
 (50-80 %) y rojo (>80 %); gris cuando no hay datos o falla la conexión. El
 anillo exterior es la sesión de 5 h y el disco interior, la semana.
 
-![El icono en sus distintos estados](docs/iconos.png)
+![El icono en sus distintos estados](https://raw.githubusercontent.com/Bimbitor/claude-usage-monitor/main/docs/iconos.png)
 
 | Interacción | Resultado |
 |---|---|
